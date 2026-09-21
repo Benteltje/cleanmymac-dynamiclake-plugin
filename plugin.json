@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "identifier": "com.dynamiclake.plugins.cleanmymac",
+  "name": "CleanMyMac",
+  "version": "1.0.0",
+  "developerName": "Benteltje",
+  "description": "Shows CleanMyMac scan progress in the notch. Displays the scan type and percentage with color-coded indicators.",
+  "executable": "cleanmymac-monitor",
+  "icon": "CleanMyMacIcon.png",
+  "args": [],
+  "autoStart": true,
+  "supportsSneakPeek": true,
+  "settings": [
+    {
+      "id": "pollSeconds",
+      "title": "Refresh",
+      "description": "How often the plugin checks CleanMyMac status.",
+      "type": "slider",
+      "default": 1.0,
+      "min": 0.5,
+      "max": 5,
+      "step": 0.25
+    },
+    {
+      "id": "showOnIdle",
+      "title": "Show when idle",
+      "description": "Show CleanMyMac status even when no scan is running.",
+      "type": "switch",
+      "default": false
+    }
+  ]
+}
