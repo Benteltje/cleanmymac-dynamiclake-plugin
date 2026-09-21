@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.plugins.cleanmymac",
   "name": "CleanMyMac",
-  "version": "1.0.0",
+  "version": "1.1.11",
   "developerName": "Benteltje",
-  "description": "Shows CleanMyMac scan progress in the notch. Displays the scan type and percentage with color-coded indicators.",
+  "description": "Shows CleanMyMac progress with official module artwork and module-matched colors.",
   "executable": "cleanmymac-monitor",
   "icon": "CleanMyMacIcon.png",
   "args": [],
@@ -12,11 +12,26 @@
   "supportsSneakPeek": true,
   "settings": [
     {
+      "id": "compactPresentation",
+      "title": "Compact appearance",
+      "description": "Use the smallest icon-and-progress layout or show the full module name.",
+      "type": "select",
+      "systemImage": "rectangle.leadinghalf.inset.filled",
+      "tint": "purple",
+      "options": [
+        { "title": "Module icon", "systemImage": "photo" },
+        { "title": "Module name", "systemImage": "textformat" }
+      ],
+      "default": "Module icon"
+    },
+    {
       "id": "pollSeconds",
       "title": "Refresh",
-      "description": "How often the plugin checks CleanMyMac status.",
+      "description": "Fallback refresh while work is active. Idle and closed states automatically use slower, efficient checks.",
       "type": "slider",
-      "default": 1.0,
+      "systemImage": "arrow.clockwise",
+      "tint": "purple",
+      "default": 0.5,
       "min": 0.5,
       "max": 5,
       "step": 0.25
@@ -26,6 +41,8 @@
       "title": "Show when idle",
       "description": "Show CleanMyMac status even when no scan is running.",
       "type": "switch",
+      "systemImage": "moon.zzz",
+      "tint": "purple",
       "default": false
     }
   ]

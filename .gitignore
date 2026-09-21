@@ -1,5 +1,7 @@
 # Built binary — rebuild with:
 # swiftc -parse-as-library Sources/CleanMyMacPlugin.swift -o cleanmymac-monitor
 cleanmymac-monitor
+build/
+dist/
 *.log
 .DS_Store
