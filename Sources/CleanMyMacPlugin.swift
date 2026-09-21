@@ -9,6 +9,8 @@ private let activityID = "cleanmymac.scan"
 private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
 private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
 private let pluginPackageEnvironmentKey = "DYNAMICLAKE_PLUGIN_PACKAGE"
+private let pluginPackagePathEnvironmentKey = "DYNAMICLAKE_PLUGIN_PACKAGE_PATH"
+private let verboseLoggingEnvironmentKey = "DYNAMICLAKE_CLEANMYMAC_DEBUG"
 private let maxFrameSize = 64 * 1024
 
 // MARK: - Time-based Progress Tracking
@@ -23,10 +25,8 @@ private var currentExecPhase: String?
 private var execPhaseIndex = 0  // 0=cleanup, 1=protection, 2=performance, 3=apps, 4=clutter
 private var lastPhaseAdvanceTime = Date()
 private var phaseStartTime = Date()
-private var lastSentProgress: Int? = nil  // Slew limiter: what we last displayed (nil = snap next)
-private var snapDisplayNext = false  // Set on run boundaries: snap instead of animating
-private var wasTerminalState = false  // Previous tick was Ready/Done: next run must snap
-private var smoothingActive = false  // Displayed != natural: fast 50ms timer must run
+private var currentProgressIsExact = false
+private var isAwaitingExecution = false
 private let cleanupDuration: TimeInterval = 10
 private let protectionDuration: TimeInterval = 55
 private let totalScanDuration: TimeInterval = 65
@@ -56,6 +56,16 @@ private func debugLog(_ message: String) {
     }
 }
 
+private let verboseLoggingEnabled: Bool = {
+    guard let value = ProcessInfo.processInfo.environment[verboseLoggingEnvironmentKey] else { return false }
+    return ["1", "true", "yes", "on"].contains(value.lowercased())
+}()
+
+private func verboseLog(_ message: @autoclosure () -> String) {
+    guard verboseLoggingEnabled else { return }
+    debugLog(message())
+}
+
 // MARK: - Scan Types & Colors
 
 private enum ScanType: String {
@@ -66,21 +76,28 @@ private enum ScanType: String {
     case malware = "Protection"
     case privacy = "Privacy"
     case optimize = "Performance"
-    case spaceLens = "My Clutter"
+    case myClutter = "My Clutter"
+    case spaceLens = "Space Lens"
+    case cloudCleanup = "Cloud Cleanup"
     case uninstaller = "Applications"
     case extensions = "Extensions"
     case unknown = "Scanning"
 
     var color: String {
         switch self {
-        case .smartScan: return "pink"
+        // DynamicLake supports named palette colors only. Its purple token is
+        // the closest match to the official Smart Care artwork (#FF7BDB);
+        // the pink token renders noticeably redder.
+        case .smartScan: return "purple"
         case .systemJunk: return "green"
         case .mailAttachment: return "orange"
         case .trash: return "red"
         case .malware: return "pink"
         case .privacy: return "indigo"
         case .optimize: return "orange"
+        case .myClutter: return "cyan"
         case .spaceLens: return "purple"
+        case .cloudCleanup: return "blue"
         case .uninstaller: return "blue"
         case .extensions: return "cyan"
         case .unknown: return "white"
@@ -96,10 +113,28 @@ private enum ScanType: String {
         case .malware: return "shield.lefthalf.filled"
         case .privacy: return "lock.shield"
         case .optimize: return "gauge.medium"
+        case .myClutter: return "folder"
         case .spaceLens: return "externaldrive"
+        case .cloudCleanup: return "cloud"
         case .uninstaller: return "xmark.app"
         case .extensions: return "puzzlepiece.extension"
         case .unknown: return "antenna.radiowaves.left.and.right"
+        }
+    }
+
+    /// Official CleanMyMac artwork extracted from the matching module bundle.
+    /// Smart Care uses the official app icon already shipped with the plugin.
+    var assetFile: String {
+        switch self {
+        case .smartScan: return "Assets/CleanMyMac-Smart-Care.png"
+        case .unknown: return "CleanMyMacIcon.png"
+        case .systemJunk, .mailAttachment, .trash: return "Assets/CleanMyMac-Cleanup.png"
+        case .malware, .privacy: return "Assets/CleanMyMac-Protection.png"
+        case .optimize: return "Assets/CleanMyMac-Performance.png"
+        case .uninstaller, .extensions: return "Assets/CleanMyMac-Applications.png"
+        case .myClutter: return "Assets/CleanMyMac-My-Clutter.png"
+        case .spaceLens: return "Assets/CleanMyMac-Space-Lens.png"
+        case .cloudCleanup: return "Assets/CleanMyMac-Cloud-Cleanup.png"
         }
     }
 
@@ -231,6 +266,12 @@ private enum ScanType: String {
             || lower == "speicherlinse" || lower == "lente spaziale" || lower == "スペースレンズ"
             || lower == "공간 렌즈" || lower == "soczewka przestrzenna" || lower == "lente espacial"
             || lower == "lente de espacio" || lower == "просторова лінза" { return .spaceLens }
+
+        // Cloud Cleanup
+        if lower == "cloud cleanup" || lower == "cloudopruiming" || lower == "nettoyage du cloud"
+            || lower == "cloud-bereinigung" || lower == "pulizia cloud" || lower == "クラウドクリーンアップ"
+            || lower == "클라우드 정리" || lower == "czyszczenie chmury" || lower == "limpeza da nuvem"
+            || lower == "limpieza de la nube" || lower == "очищення хмари" { return .cloudCleanup }
         
         // Uninstaller / Applications (mapped from "Applications" module name)
         if lower == "applications" || lower == "toepassingen" || lower == "applications"
@@ -254,7 +295,7 @@ private enum ScanType: String {
         if lower == "my clutter" || lower == "mijn rommel" || lower == "mes déchets"
             || lower == "mein unordnung" || lower == "i miei disordini" || lower == "マイクラッター"
             || lower == "내 클러터" || lower == "mój bałagan" || lower == "meus entulhos"
-            || lower == "mi desorden" || lower == "мій безлад" { return .spaceLens }
+            || lower == "mi desorden" || lower == "мій безлад" { return .myClutter }
         
         // Trash Bins
         if lower.contains("trash") || lower.contains("prullenbak") || lower.contains("corbeille")
@@ -285,6 +326,21 @@ private enum ScanType: String {
             || lower.contains("speicher") || lower.contains("spazio") || lower.contains("スペース")
             || lower.contains("공간") || lower.contains("przestrzeń") || lower.contains("espaço")
             || lower.contains("espacio") || lower.contains("простір") { return .spaceLens }
+
+        // Cloud Cleanup
+        if lower.contains("cloud cleanup") || lower.contains("cloudopruiming")
+            || lower.contains("nettoyage du cloud") || lower.contains("cloud-bereinigung")
+            || lower.contains("pulizia cloud") || lower.contains("クラウドクリーンアップ")
+            || lower.contains("클라우드 정리") || lower.contains("czyszczenie chmury")
+            || lower.contains("limpeza da nuvem") || lower.contains("limpieza de la nube")
+            || lower.contains("очищення хмари") { return .cloudCleanup }
+
+        // My Clutter (keep separate from Space Lens)
+        if lower.contains("my clutter") || lower.contains("mijn rommel") || lower.contains("mes déchets")
+            || lower.contains("mein unordnung") || lower.contains("i miei disordini")
+            || lower.contains("マイクラッター") || lower.contains("내 클러터")
+            || lower.contains("mój bałagan") || lower.contains("meus entulhos")
+            || lower.contains("mi desorden") || lower.contains("мій безлад") { return .myClutter }
         
         // Uninstaller / Applications (all languages)
         if lower.contains("uninstall") || lower.contains("app uninstaller") || lower.contains("toepassingen")
@@ -307,8 +363,14 @@ private enum ScanType: String {
 // MARK: - Settings
 
 private struct PluginSettings: Equatable {
-    var pollSeconds: TimeInterval = 1
+    var pollSeconds: TimeInterval = 0.5
     var showOnIdle = false
+    var compactPresentation: CompactPresentation = .moduleIcon
+}
+
+private enum CompactPresentation: String {
+    case moduleIcon = "Module icon"
+    case moduleName = "Module name"
 }
 
 // MARK: - Errors
@@ -453,19 +515,48 @@ private func loadSettings() -> PluginSettings {
     func get(_ id: String, _ def: Any) -> Any {
         values[id] ?? ProcessInfo.processInfo.environment[environmentSettingKey(for: id)] ?? def
     }
-    let poll = get("pollSeconds", 1.0) as? Double ?? 1.0
-    let idle = get("showOnIdle", false) as? Bool ?? false
-    return PluginSettings(pollSeconds: min(max(poll, 0.5), 5), showOnIdle: idle)
+    func double(_ id: String, default def: Double) -> Double {
+        let value = get(id, def)
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String, let number = Double(string) { return number }
+        return def
+    }
+    func bool(_ id: String, default def: Bool) -> Bool {
+        let value = get(id, def)
+        if let flag = value as? Bool { return flag }
+        if let number = value as? NSNumber { return number.boolValue }
+        if let string = value as? String {
+            return ["1", "true", "yes", "on"].contains(string.lowercased())
+        }
+        return def
+    }
+    func string(_ id: String, default def: String) -> String {
+        get(id, def) as? String ?? def
+    }
+
+    let poll = double("pollSeconds", default: 0.5)
+    let idle = bool("showOnIdle", default: false)
+    let presentation = CompactPresentation(
+        rawValue: string("compactPresentation", default: CompactPresentation.moduleIcon.rawValue)
+    ) ?? .moduleIcon
+    return PluginSettings(
+        pollSeconds: min(max(poll, 0.5), 5),
+        showOnIdle: idle,
+        compactPresentation: presentation
+    )
 }
 
 // MARK: - Accessibility: CleanMyMac Detection
 
-private let cmmBundleIDs = [
+private let cmmMainBundleIDs = [
     "com.macpaw.CleanMyMac5",
-    "com.macpaw.CleanMyMac5.Menu",
     "com.macpaw.CleanMyMacX",
+    "com.macpaw.CleanMyMac"
+]
+
+private let cmmBundleIDs = cmmMainBundleIDs + [
+    "com.macpaw.CleanMyMac5.Menu",
     "com.macpaw.CleanMyMacX.Menu",
-    "com.macpaw.CleanMyMac",
     "com.macpaw.CleanMyMac.Menu"
 ]
 
@@ -500,13 +591,16 @@ private func allText(from element: AXUIElement, depth: Int = 0) -> [String] {
 /// Extracts the ModuleNameLabel value from the AX tree (e.g., "Smart Care", "Cleanup", "Malware Removal")
 private func extractModuleName(from element: AXUIElement, depth: Int = 0) -> String? {
     guard depth < 15 else { return nil }
-    
+
     var ident: AnyObject?
     AXUIElementCopyAttributeValue(element, kAXIdentifierAttribute as CFString, &ident)
     if let id = ident as? String, id == "ModuleNameLabel" {
         var val: AnyObject?
         AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &val)
-        return val as? String
+        if let value = val as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
     }
     
     var children: AnyObject?
@@ -530,7 +624,10 @@ private func extractIntroTitle(from element: AXUIElement, depth: Int = 0) -> Str
     if let id = ident as? String, id == "IntroViewTitleLabel" {
         var val: AnyObject?
         AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &val)
-        return val as? String
+        if let value = val as? String {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
     }
     
     var children: AnyObject?
@@ -543,6 +640,69 @@ private func extractIntroTitle(from element: AXUIElement, depth: Int = 0) -> Str
         }
     }
     return nil
+}
+
+/// True only for status labels that describe work happening right now. Using
+/// the complete window text caused result buttons such as "Remove" and stale
+/// sidebar content to be mistaken for a newly started action.
+private func hasActiveOperation(in texts: [String]) -> Bool {
+    let activePhrases = [
+        "cleaning ", "removing ", "checking ", "scanning ", "analyzing ",
+        "processing ", "digging through", "visualizing your storage space",
+        "running your task", "installing update",
+        "decluttering", "aan het opruimen", "aan het verwijderen",
+        "aan het controleren", "aan het analyseren", "aan het scannen",
+        "nettoyage en cours", "suppression en cours", "vérification en cours",
+        "wird bereinigt", "wird entfernt", "wird überprüft", "wird gescannt",
+        "pulizia in corso", "rimozione in corso", "controllo in corso",
+        "クリーン中", "削除中", "確認中", "スキャン中", "分析中", "処理中",
+        "정리 중", "제거 중", "확인 중", "스캔 중", "분석 중", "처리 중"
+    ]
+    return texts.contains { text in
+        let normalized = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        return activePhrases.contains { normalized.contains($0) }
+    }
+}
+
+private func isMyClutterResultsPage(_ texts: [String], moduleName: String?) -> Bool {
+    guard moduleName.map(ScanType.detect(from:)) == .myClutter else { return false }
+    let combined = texts.joined(separator: " ").lowercased()
+    let hasResultContent = combined.contains("files to sort through")
+        || combined.contains("review all files")
+    return combined.contains("start over") && hasResultContent
+}
+
+private func isSpaceLensResultsPage(_ texts: [String], moduleName: String?) -> Bool {
+    guard moduleName.map(ScanType.detect(from:)) == .spaceLens else { return false }
+    let combined = texts.joined(separator: " ").lowercased()
+    guard combined.contains("start over") else { return false }
+    let hasEmptyResult = combined.contains("too empty to visualize")
+    let hasStorageMap = combined.contains("macintosh hd")
+        && combined.contains(" used")
+    return hasEmptyResult || hasStorageMap
+}
+
+private func estimatedStorageProgress(scanType: ScanType, elapsed: TimeInterval) -> Int {
+    let expectedDuration: TimeInterval
+    switch scanType {
+    case .myClutter: expectedDuration = 85
+    case .spaceLens: expectedDuration = 120
+    case .cloudCleanup: expectedDuration = 90
+    default: expectedDuration = 75
+    }
+    return min(95, max(1, Int((elapsed / expectedDuration) * 95)))
+}
+
+private func resetTrackedActivity() {
+    scanStartTime = nil
+    currentScanPhase = nil
+    executionStartTime = nil
+    detectedScanType = nil
+    lastDetectionTime = nil
+    currentExecPhase = nil
+    isInExecutionMode = false
+    isAwaitingExecution = false
+    execPhaseIndex = 0
 }
 
 /// Searches the entire AX hierarchy for a percentage value (0-100).
@@ -559,11 +719,11 @@ private func findPercentage(in element: AXUIElement, depth: Int = 0) -> Int? {
             let d = num.doubleValue
             if d >= 0 && d <= 1.0 {
                 let pct = Int(d * 100)
-                debugLog("AXProgressIndicator value=\(d) -> \(pct)%")
+                verboseLog("AXProgressIndicator value=\(d) -> \(pct)%")
                 return pct
             }
             if d >= 0 && d <= 100 {
-                debugLog("AXProgressIndicator value=\(d) -> \(Int(d))%")
+                verboseLog("AXProgressIndicator value=\(d) -> \(Int(d))%")
                 return Int(d)
             }
         }
@@ -609,6 +769,72 @@ private func extractPercentage(from text: String) -> Int? {
     return (num >= 0 && num <= 100) ? num : nil
 }
 
+private struct AXWindowSnapshot {
+    var texts: [String] = []
+    var moduleName: String?
+    var introTitle: String?
+    var progress: Int?
+}
+
+/// Reads each AX node once. Earlier versions walked the same tree separately
+/// for text, module name, intro title, and progress, multiplying IPC work.
+private func collectAXWindowSnapshot(from root: AXUIElement) -> AXWindowSnapshot {
+    var snapshot = AXWindowSnapshot()
+
+    func attribute(_ element: AXUIElement, _ key: CFString) -> AnyObject? {
+        var value: AnyObject?
+        AXUIElementCopyAttributeValue(element, key, &value)
+        return value
+    }
+
+    func visit(_ element: AXUIElement, depth: Int) {
+        guard depth < 15 else { return }
+
+        let title = attribute(element, kAXTitleAttribute as CFString) as? String
+        let description = attribute(element, kAXDescriptionAttribute as CFString) as? String
+        let rawValue = attribute(element, kAXValueAttribute as CFString)
+        let value = rawValue as? String
+        let label = attribute(element, "AXLabel" as CFString) as? String
+
+        if depth < 10 {
+            for text in [title, description, value, label].compactMap({ $0 }) where !text.isEmpty {
+                snapshot.texts.append(text)
+            }
+        }
+
+        let identifier = attribute(element, kAXIdentifierAttribute as CFString) as? String
+        if let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
+            if identifier == "ModuleNameLabel", snapshot.moduleName == nil { snapshot.moduleName = trimmed }
+            if identifier == "IntroViewTitleLabel", snapshot.introTitle == nil { snapshot.introTitle = trimmed }
+        }
+
+        if snapshot.progress == nil {
+            let role = attribute(element, kAXRoleAttribute as CFString) as? String
+            if role == "AXProgressIndicator", let number = rawValue as? NSNumber {
+                let numericValue = number.doubleValue
+                if numericValue >= 0, numericValue <= 1 {
+                    snapshot.progress = Int(numericValue * 100)
+                } else if numericValue >= 0, numericValue <= 100 {
+                    snapshot.progress = Int(numericValue)
+                }
+            }
+            if snapshot.progress == nil {
+                snapshot.progress = [title, description, value, label]
+                    .compactMap { $0 }
+                    .compactMap(extractPercentage(from:))
+                    .first
+            }
+        }
+
+        if let children = attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] {
+            for child in children { visit(child, depth: depth + 1) }
+        }
+    }
+
+    visit(root, depth: 0)
+    return snapshot
+}
+
 /// Bundle names of the CleanMyMac main app (NOT helpers like Menu/HealthMonitor).
 private let cmmMainBundleNames = ["CleanMyMac_5", "CleanMyMac X", "CleanMyMac"]
 
@@ -623,11 +849,31 @@ private func isMainCMMExecutable(_ exePath: String) -> Bool {
     return cmmMainBundleNames.contains(bundleName)
 }
 
-/// Finds the CleanMyMac main app PID via a LIVE kernel query (libproc).
+private var cachedCMMMainPID: pid_t = 0
+private var lastCMMProcessScan = Date.distantPast
+private let cmmProcessScanCooldown: TimeInterval = 10
+
+private func invalidateCMMMainPIDCache() {
+    cachedCMMMainPID = 0
+    lastCMMProcessScan = .distantPast
+}
+
+/// Finds the CleanMyMac main app PID via a kernel query (libproc).
 /// NSWorkspace.shared.runningApplications turned out to be a stale snapshot
 /// inside this long-running plugin process (dead PIDs linger, fresh ones
-/// missing), so we enumerate PIDs directly — no cache, no child processes.
-private func findCMMMainPID() -> pid_t {
+/// missing), so libproc remains the source of truth. Positive results are
+/// retained while the process lives and negative scans are throttled.
+private func findCMMMainPID(forceRefresh: Bool = false) -> pid_t {
+    if cachedCMMMainPID > 0 {
+        if kill(cachedCMMMainPID, 0) == 0 { return cachedCMMMainPID }
+        cachedCMMMainPID = 0
+    }
+
+    if !forceRefresh, Date().timeIntervalSince(lastCMMProcessScan) < cmmProcessScanCooldown {
+        return 0
+    }
+    lastCMMProcessScan = Date()
+
     let size = Int(proc_listpids(UInt32(PROC_ALL_PIDS), 0, nil, 0))
     guard size > 0 else { return 0 }
     var pids = [pid_t](repeating: 0, count: size / MemoryLayout<pid_t>.size + 1)
@@ -645,6 +891,7 @@ private func findCMMMainPID() -> pid_t {
         }
         guard len > 0 else { continue }
         if isMainCMMExecutable(String(cString: path)) {
+            cachedCMMMainPID = pid
             return pid
         }
     }
@@ -671,7 +918,7 @@ private func detectViaCGWindow(pid: pid_t) -> (isScanning: Bool, scanType: ScanT
     guard !allTexts.isEmpty else { return nil }
 
     let combined = allTexts.joined(separator: " ").lowercased()
-    debugLog("CGWindow texts: \(allTexts.prefix(5))")
+    verboseLog("CGWindow texts: \(allTexts.prefix(5))")
 
     let isScanning = combined.contains("scanning") || combined.contains("analyzing")
         || combined.contains("looking for") || combined.contains("cleaning")
@@ -693,11 +940,12 @@ private func detectViaCGWindow(pid: pid_t) -> (isScanning: Bool, scanType: ScanT
         // Try to find percentage from window titles
         for text in allTexts {
             if let pct = extractPercentage(from: text) {
-                debugLog("CGWindow: \(scanType.rawValue) at \(pct)%")
+                currentProgressIsExact = true
+                verboseLog("CGWindow: \(scanType.rawValue) at \(pct)%")
                 return (true, scanType, pct)
             }
         }
-        debugLog("CGWindow: scanning detected (no percentage): \(scanType.rawValue)")
+        verboseLog("CGWindow: scanning detected (no percentage): \(scanType.rawValue)")
         return (true, scanType, 0)
     }
 
@@ -706,7 +954,7 @@ private func detectViaCGWindow(pid: pid_t) -> (isScanning: Bool, scanType: ScanT
         || combined.contains("found") || combined.contains("items")
         || combined.contains("gevonden") || combined.contains("rommel") {
         let scanType = ScanType.detect(from: allTexts.joined(separator: " "))
-        debugLog("CGWindow: scan complete: \(scanType.rawValue)")
+        verboseLog("CGWindow: scan complete: \(scanType.rawValue)")
         return (true, scanType, 100)
     }
 
@@ -726,72 +974,29 @@ private func execProgress(phase: Int, elapsed: TimeInterval) -> Int {
 }
 
 /// Main detection function: finds CleanMyMac and reads its state.
-/// The returned progress is slew-limited: it moves at most 1% per call toward
-/// the true value, so phase changes animate instead of teleporting.
-/// Callers must ensure the 50ms transition timer runs while smoothingActive.
-private func detectCleanMyMacState() -> (isScanning: Bool, scanType: ScanType, progress: Int, isReady: Bool, isExecutionDone: Bool, junkSize: String?)? {
-    guard var state = detectRawCleanMyMacState() else {
-        // Idle: clear smoothing state so the next run snaps instead of
-        // slewing down from a stale value.
-        lastSentProgress = nil
-        snapDisplayNext = false
-        wasTerminalState = false
-        smoothingActive = false
+/// Exact progress is passed through immediately. When CleanMyMac exposes only
+/// a phase, the renderer uses an indeterminate bar instead of a fake percentage.
+private func detectCleanMyMacState(cmmPID: pid_t? = nil) -> (isScanning: Bool, scanType: ScanType, progress: Int, isReady: Bool, isExecutionDone: Bool, junkSize: String?)? {
+    guard var state = detectRawCleanMyMacState(cmmPID: cmmPID) else {
         return nil
     }
 
-    // Terminal states (Ready/Done): first let the circle fill to 100%,
-    // only then report terminal so the text appears after a full circle.
+    // Terminal states must match CleanMyMac immediately; never animate a
+    // synthetic fill after CleanMyMac has already finished.
     if state.isReady || state.isExecutionDone {
-        let cur = lastSentProgress ?? 100
-        if cur < 100 {
-            // Converge in ~10 sends regardless of gap size.
-            let step = max(1, (100 - cur) / 10)
-            let next = min(cur + step, 100)
-            lastSentProgress = next
-            smoothingActive = true
-            state.progress = next
-            state.isReady = false
-            state.isExecutionDone = false
-            return state
-        }
-        lastSentProgress = 100
-        wasTerminalState = true
-        smoothingActive = false
         state.progress = 100
+        isAwaitingExecution = state.isReady
         return state
     }
 
-    // A fresh run after a terminal state must snap, not slew 100→0.
-    if wasTerminalState {
-        snapDisplayNext = true
-        wasTerminalState = false
-    }
-
-    let natural = min(state.progress, 99)  // 100 is reserved for Ready/Done
-    if snapDisplayNext || lastSentProgress == nil {
-        lastSentProgress = natural
-        snapDisplayNext = false
-        smoothingActive = false
-    } else if let cur = lastSentProgress, cur != natural {
-        // Converge in ~10 sends regardless of gap size (rate-limit friendly).
-        let remaining = abs(natural - cur)
-        let step = max(1, remaining / 10)
-        lastSentProgress = cur + (natural > cur ? min(step, remaining) : -min(step, remaining))
-        smoothingActive = true
-    } else {
-        smoothingActive = false
-    }
-    state.progress = lastSentProgress ?? natural
+    state.progress = min(state.progress, 99)
     return state
 }
 
-private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType, progress: Int, isReady: Bool, isExecutionDone: Bool, junkSize: String?)? {
-    var cmmPID: pid_t = 0
-
-    // Live kernel PID lookup (libproc) — NSWorkspace snapshots go stale here.
-    cmmPID = findCMMMainPID()
-    if cmmPID > 0 { debugLog("Found CleanMyMac pid=\(cmmPID)") }
+private func detectRawCleanMyMacState(cmmPID suppliedPID: pid_t? = nil) -> (isScanning: Bool, scanType: ScanType, progress: Int, isReady: Bool, isExecutionDone: Bool, junkSize: String?)? {
+    currentProgressIsExact = false
+    let cmmPID = suppliedPID ?? findCMMMainPID()
+    if cmmPID > 0 { verboseLog("Found CleanMyMac pid=\(cmmPID)") }
 
     guard cmmPID > 0 else {
         scanStartTime = nil
@@ -807,32 +1012,34 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
     let windows = windowList as? [AXUIElement] ?? []
 
     if windows.isEmpty {
-        debugLog("AXUIElement: no windows, trying CGWindowList fallback")
+        verboseLog("AXUIElement: no windows, trying CGWindowList fallback")
         if let fallbackState = detectViaCGWindow(pid: cmmPID) {
             return (fallbackState.isScanning, fallbackState.scanType, fallbackState.progress, false, false, nil)
         }
-        debugLog("No windows found via any method")
+        verboseLog("No windows found via any method")
         return nil
     }
 
     // Collect all texts from ALL windows first, then detect
     var allTexts: [String] = []
     var effectiveModuleName: String?
+    var moduleNameCandidate: String?
+    var introTitleCandidate: String?
+    var observedProgress: Int?
     for window in windows {
-        var title: AnyObject?
-        AXUIElementCopyAttributeValue(window, kAXTitleAttribute as CFString, &title)
-        let titleStr = (title as? String) ?? ""
-        debugLog("Window: '\(titleStr)'")
-
-        let texts = allText(from: window)
+        let snapshot = collectAXWindowSnapshot(from: window)
+        let texts = snapshot.texts
         if !texts.isEmpty {
-            debugLog("All text: \(texts.prefix(10))")
+            verboseLog("All text: \(texts.prefix(10))")
             allTexts.append(contentsOf: texts)
-            if effectiveModuleName == nil {
-                let moduleName = extractModuleName(from: window)
-                let introTitle = extractIntroTitle(from: window)
-                effectiveModuleName = moduleName ?? introTitle
-                debugLog("Module name: \(moduleName ?? "nil"), Intro title: \(introTitle ?? "nil")")
+            let moduleName = snapshot.moduleName
+            let introTitle = snapshot.introTitle
+            if let moduleName { moduleNameCandidate = moduleName }
+            if let introTitle { introTitleCandidate = introTitle }
+            verboseLog("Module name: \(moduleName ?? "nil"), Intro title: \(introTitle ?? "nil")")
+            if observedProgress == nil {
+                observedProgress = snapshot.progress
+                if observedProgress != nil { currentProgressIsExact = true }
             }
         }
     }
@@ -840,7 +1047,14 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
     // Use combined texts from all windows
     let texts = allTexts
     let combined = texts.joined(separator: " ").lowercased()
-    
+    // An intro title is the strongest signal that the user merely navigated
+    // to a module. Prefer it over stale result labels and end any old session.
+    effectiveModuleName = introTitleCandidate ?? moduleNameCandidate
+    if let introTitleCandidate {
+        verboseLog("Idle module intro: \(introTitleCandidate); resetting tracked activity")
+        resetTrackedActivity()
+        return nil
+    }
     // Extract junk size (e.g., "738 MB", "1,5 GB", "1.5 GB") and shorten it
     var foundJunkSize: String?
     for t in texts {
@@ -858,6 +1072,22 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             foundJunkSize = shortened
             break
         }
+    }
+
+    // My Clutter keeps its old "Digging through" accessibility nodes and a
+    // stale 99% value after the visible results page is already ready. The
+    // explicit results UI must win so the Notch can show its checkmark.
+    if isMyClutterResultsPage(texts, moduleName: effectiveModuleName) {
+        let finishedExecution = isInExecutionMode
+        lastDetectionTime = Date()
+        debugLog("My Clutter results page: \(finishedExecution ? "execution done" : "scan ready")")
+        return (true, .myClutter, 100, !finishedExecution, finishedExecution, foundJunkSize)
+    }
+    if isSpaceLensResultsPage(texts, moduleName: effectiveModuleName) {
+        let finishedExecution = isInExecutionMode
+        lastDetectionTime = Date()
+        debugLog("Space Lens results page: \(finishedExecution ? "execution done" : "scan ready")")
+        return (true, .spaceLens, 100, !finishedExecution, finishedExecution, foundJunkSize)
     }
 
         // Detect scan phase based on keywords (supports all 12 CleanMyMac languages)
@@ -935,7 +1165,7 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
         
         if isInExecutionMode {
             isExecPhase = true
-            debugLog("EXEC TEXTS: \(texts)")
+            verboseLog("EXEC TEXTS: \(texts)")
             // Count individual done tiles (each text = one tile)
             var doneCount = 0
             for t in texts {
@@ -958,7 +1188,7 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
                 }
             }
             doneCount = min(doneCount, 5)
-            debugLog("Exec phase: doneCount=\(doneCount)")
+            verboseLog("Exec phase: doneCount=\(doneCount)")
             if doneCount <= 0 { isExecCleanup = true }
             else if doneCount == 1 { isExecProtection = true }
             else if doneCount == 2 { isExecPerformance = true }
@@ -968,76 +1198,25 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             isExecPhase = false
         }
         
-        // Detect task execution (after clicking Run)
-        // These keywords appear during task execution in the tile status labels
-        let isCleaning = combined.contains("cleaning") || combined.contains("aan het opruimen")
-            || combined.contains("nettoyage en cours") || combined.contains("wird bereinigt")
-            || combined.contains("pulizia in corso") || combined.contains("クリーン中")
-            || combined.contains("정리 중") || combined.contains("czyszczenie")
-            || combined.contains("limpando") || combined.contains("limpiando")
-            || combined.contains("очищення")
-        
-        let isRemoving = combined.contains("removing") || combined.contains("aan het verwijderen")
-            || combined.contains("suppression en cours") || combined.contains("wird entfernt")
-            || combined.contains("rimozione in corso") || combined.contains("削除中")
-            || combined.contains("제거 중") || combined.contains("usuwanie")
-            || combined.contains("removendo") || combined.contains("eliminando")
-            || combined.contains("видалення")
-        
-        let isOptimizing = combined.contains("optimizing") || combined.contains("aan het optimaliseren")
-            || combined.contains("optimisation en cours") || combined.contains("wird optimiert")
-            || combined.contains("ottimizzazione in corso") || combined.contains("最適化中")
-            || combined.contains("최적화 중") || combined.contains("optymalizacja")
-            || combined.contains("otimizando") || combined.contains("optimizando")
-            || combined.contains("оптимізація")
-        
-        let isChecking = combined.contains("checking") || combined.contains("aan het controleren")
-            || combined.contains("vérification en cours") || combined.contains("wird überprüft")
-            || combined.contains("controllo in corso") || combined.contains("確認中")
-            || combined.contains("확인 중") || combined.contains("sprawdzanie")
-            || combined.contains("verificando") || combined.contains("comprobando")
-            || combined.contains("перевірка")
-        
-        let isExecutingTasks = isCleaning || isRemoving || isOptimizing || isChecking
-        
         // Check if any tile shows an active execution status (not just results)
-        let isActiveExecution = combined.contains("cleaning") || combined.contains("removing")
-            || combined.contains("checking") || combined.contains("scanning")
-            || combined.contains("analyzing") || combined.contains("processing")
-            || combined.contains("aan het opruimen") || combined.contains("aan het verwijderen")
-            || combined.contains("aan het controleren") || combined.contains("aan het analyseren")
-            || combined.contains("aan het scannen") || combined.contains("aan het verwerken")
-            || combined.contains("nettoyage en cours") || combined.contains("suppression en cours")
-            || combined.contains("vérification en cours") || combined.contains("scan en cours")
-            || combined.contains("analyse en cours") || combined.contains("traitement en cours")
-            || combined.contains("wird bereinigt") || combined.contains("wird entfernt")
-            || combined.contains("wird überprüft") || combined.contains("wird gescannt")
-            || combined.contains("wird analysiert") || combined.contains("wird verarbeitet")
-            || combined.contains("pulizia in corso") || combined.contains("rimozione in corso")
-            || combined.contains("controllo in corso") || combined.contains("scansione in corso")
-            || combined.contains("analisi in corso") || combined.contains("elaborazione in corso")
-            || combined.contains("クリーン中") || combined.contains("削除中")
-            || combined.contains("確認中") || combined.contains("スキャン中")
-            || combined.contains("分析中") || combined.contains("処理中")
-            || combined.contains("정리 중") || combined.contains("제거 중")
-            || combined.contains("확인 중") || combined.contains("스캔 중")
-            || combined.contains("분석 중") || combined.contains("처리 중")
-            || combined.contains("czyszczenie") || combined.contains("usuwanie")
-            || combined.contains("sprawdzanie") || combined.contains("skanowanie")
-            || combined.contains("analizowanie") || combined.contains("przetwarzanie")
-            || combined.contains("limpando") || combined.contains("removendo")
-            || combined.contains("verificando") || combined.contains("analisando")
-            || combined.contains("processando") || combined.contains("limpiando")
-            || combined.contains("eliminando") || combined.contains("comprobando")
-            || combined.contains("escaneando") || combined.contains("procesando")
-            || combined.contains("очищення") || combined.contains("видалення")
-            || combined.contains("перевірка") || combined.contains("сканування")
-            || combined.contains("аналіз") || combined.contains("обробка")
+        let isActiveExecution = hasActiveOperation(in: texts)
         
-        let isActive = isScanning || isExecutingTasks || isActiveExecution || isExecPhase || isInExecutionMode
+        let isActive = isScanning || isActiveExecution || isExecPhase || isInExecutionMode
 
         // Track scan start time and phase
         if isActive {
+            if let name = effectiveModuleName {
+                let visibleType = ScanType.detect(from: name)
+                if visibleType != .unknown, visibleType != detectedScanType {
+                    detectedScanType = visibleType
+                    debugLog("Visible module changed to \(visibleType.rawValue)")
+                }
+            }
+            let isStorageScan = !isAwaitingExecution && !isInExecutionMode && isActiveExecution
+                && [ScanType.myClutter, .spaceLens, .cloudCleanup].contains(detectedScanType)
+            if isStorageScan {
+                currentExecPhase = nil
+            }
             var newPhase = "unknown"
             if isExecCleanup { newPhase = "exec-cleanup" }
             else if isExecProtection { newPhase = "exec-protection" }
@@ -1049,21 +1228,22 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             else if isPerformancePhase { newPhase = "performance" }
             else if isAppsPhase { newPhase = "apps" }
             else if isClutterPhase { newPhase = "clutter" }
+            else if isStorageScan { newPhase = "storage-scan" }
             else if isActiveExecution { newPhase = "executing" }
             else if isScanning { newPhase = "scanning" }
             
             // Detect execution start: scan completed, now tile activity begins
             // When we see active tile work (Cleaning, Removing etc.) but NOT scanning keywords,
             // it means the user clicked Run
-            if !isInExecutionMode && scanStartTime != nil && (isCleaning || isRemoving || isOptimizing || isChecking) && !isScanning {
+            if !isInExecutionMode && isAwaitingExecution && isActiveExecution && !isScanning {
                 scanStartTime = Date()
                 executionStartTime = Date()
                 isInExecutionMode = true
+                isAwaitingExecution = false
                 execPhaseIndex = 0
                 lastPhaseAdvanceTime = Date()
                 phaseStartTime = Date()
                 currentExecPhase = "exec-cleanup"
-                snapDisplayNext = true  // Fresh run: snap, don't slew from Ready state
                 debugLog("Execution started via tile activity")
             }
             // Detect execution phase change - update phase but don't reset timer
@@ -1077,7 +1257,6 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
                 // Only set scanStartTime and detectedScanType on first detection
                 if scanStartTime == nil {
                     scanStartTime = Date()
-                    snapDisplayNext = true  // Fresh run: snap, don't slew from stale value
                     if let name = effectiveModuleName {
                         detectedScanType = ScanType.detect(from: name)
                     } else {
@@ -1205,9 +1384,9 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
                 // Time-based progress within current phase.
                 // Smoothing (1% steps) is applied centrally in detectCleanMyMacState().
                 let elapsed = now.timeIntervalSince(phaseStartTime)
-                let progress = execProgress(phase: execPhaseIndex, elapsed: elapsed)
+                let progress = observedProgress ?? execProgress(phase: execPhaseIndex, elapsed: elapsed)
                 
-                debugLog("Exec active: cleanup=\(cleanupActive) protection=\(protectionActive) perf=\(performanceActive) apps=\(appsActive) clutter=\(clutterActive) → phase=\(execPhaseIndex) progress=\(progress)%")
+                verboseLog("Exec active: cleanup=\(cleanupActive) protection=\(protectionActive) perf=\(performanceActive) apps=\(appsActive) clutter=\(clutterActive) → phase=\(execPhaseIndex) progress=\(progress)%")
                 lastDetectionTime = Date()
                 let scanType = detectedScanType ?? ScanType.detect(from: texts.joined(separator: " "))
                 return (true, scanType, progress, false, false, foundJunkSize)
@@ -1218,8 +1397,13 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             // Time-based progress within current phase.
             // Smoothing (1% steps) is applied centrally in detectCleanMyMacState().
             let progress: Int
-            if let st = detectedScanType, st != .smartScan {
-                progress = min(99, Int((elapsed / 60.0) * 99))
+            if let observedProgress {
+                progress = min(99, max(0, observedProgress))
+            } else if let st = detectedScanType,
+                      [.myClutter, .spaceLens, .cloudCleanup].contains(st) {
+                progress = estimatedStorageProgress(scanType: st, elapsed: elapsed)
+            } else if let st = detectedScanType, st != .smartScan {
+                progress = min(95, Int((elapsed / 60.0) * 95))
             } else if isCleanupPhase {
                 progress = min(15, Int((elapsed / 15.0) * 15))
             } else if isProtectionPhase {
@@ -1238,7 +1422,7 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             
             lastDetectionTime = Date()
             let scanType = detectedScanType ?? ScanType.detect(from: texts.joined(separator: " "))
-            debugLog("Scanning detected: \(scanType.rawValue) phase=\(currentScanPhase ?? "?") progress=\(progress)%")
+            verboseLog("Scanning detected: \(scanType.rawValue) phase=\(currentScanPhase ?? "?") progress=\(progress)%")
             return (true, scanType, progress, false, false, foundJunkSize)
         }
         
@@ -1275,7 +1459,7 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
                 // Simple time-based progress during execution
                 let elapsed = Date().timeIntervalSince(executionStartTime ?? Date())
                 let progress = min(95, Int((elapsed / executionDuration) * 95))
-                debugLog("Task execution detected: \(scanType.rawValue) phase=\(currentScanPhase ?? "?") progress=\(progress)% elapsed=\(String(format: "%.1f", elapsed))s")
+                verboseLog("Task execution detected: \(scanType.rawValue) phase=\(currentScanPhase ?? "?") progress=\(progress)% elapsed=\(String(format: "%.1f", elapsed))s")
                 
                 // Check if execution is done: all tiles show final status AND enough time has passed
                 // Also check that we see results keywords (not just "Done" from a single completed tile)
@@ -1363,19 +1547,13 @@ private func detectRawCleanMyMacState() -> (isScanning: Bool, scanType: ScanType
             default:            progress = min(95, Int((elapsed / 30.0) * 95))
             }
             let scanType: ScanType = detectedScanType ?? .unknown
-            debugLog("Keeping last scan state: \(scanType.rawValue) phase=\(phase) progress=\(progress)%")
+            verboseLog("Keeping last scan state: \(scanType.rawValue) phase=\(phase) progress=\(progress)%")
             return (true, scanType, progress, false, false, foundJunkSize)
         }
     }
 
-    debugLog("No scan state detected")
-    scanStartTime = nil
-    currentScanPhase = nil
-    executionStartTime = nil
-    detectedScanType = nil
-    lastDetectionTime = nil
-    isInExecutionMode = false
-    execPhaseIndex = 0
+    verboseLog("No scan state detected")
+    resetTrackedActivity()
     return nil
 }
 
@@ -1408,13 +1586,80 @@ private func closeSneakPeekPayload() -> [String: Any] {
     ]
 }
 
-private func activityPayload(commandType: String, scanType: ScanType, progress: Int, isReady: Bool = false, currentAction: String? = nil, junkSize: String? = nil) -> [String: Any] {
+private var moduleIconBase64Cache: [String: String] = [:]
+
+/// Compact Live Activities reject `packageFile` images in DynamicLake 1.9.7.5,
+/// so module artwork must be embedded as bounded inline PNG data there.
+private func inlineModuleIconPayload(scanType: ScanType, id: String) -> [String: Any]? {
+    let assetFile = scanType.assetFile
+    if let encoded = moduleIconBase64Cache[assetFile] {
+        return [
+            "type": "image", "id": id,
+            "source": "inlineData", "mimeType": "image/png", "base64Data": encoded
+        ]
+    }
+
+    let environment = ProcessInfo.processInfo.environment
+    var roots: [URL] = []
+    for key in [pluginPackageEnvironmentKey, pluginPackagePathEnvironmentKey] {
+        if let path = environment[key], !path.isEmpty {
+            roots.append(URL(fileURLWithPath: path, isDirectory: true))
+        }
+    }
+    roots.append(URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent())
+    roots.append(URL(fileURLWithPath: FileManager.default.currentDirectoryPath, isDirectory: true))
+
+    for root in roots {
+        let url = root.appendingPathComponent(assetFile)
+        guard let data = try? Data(contentsOf: url),
+              !data.isEmpty,
+              data.count <= 48 * 1024,
+              data.starts(with: [0x89, 0x50, 0x4E, 0x47]) else { continue }
+        let encoded = data.base64EncodedString()
+        moduleIconBase64Cache[assetFile] = encoded
+        return [
+            "type": "image", "id": id,
+            "source": "inlineData", "mimeType": "image/png", "base64Data": encoded
+        ]
+    }
+    return nil
+}
+
+/// CleanMyMac 5 does not expose a numeric percentage for every scan. In that
+/// case use stable phase checkpoints: the indicator moves only when the app
+/// itself advances, rather than spinning or drifting on a timer.
+private func phaseAlignedProgress(_ phase: String) -> Int {
+    switch phase {
+    case "cleanup", "exec-cleanup": return 10
+    case "protection", "exec-protection": return 35
+    case "performance", "exec-performance": return 58
+    case "apps", "exec-apps": return 74
+    case "clutter", "exec-clutter": return 88
+    case "scanning", "storage-scan", "executing": return 50
+    default: return 8
+    }
+}
+
+private func activityPayload(
+    commandType: String,
+    scanType: ScanType,
+    progress: Int,
+    settings: PluginSettings,
+    progressIsExact: Bool = false,
+    isIdle: Bool = false,
+    isReady: Bool = false,
+    currentAction: String? = nil,
+    junkSize: String? = nil
+) -> [String: Any] {
     let color = scanType.color
     let label = scanType.rawValue
     let percentText: String
     let status: String
     
-    if isReady {
+    if isIdle {
+        percentText = "Idle"
+        status = "success"
+    } else if isReady {
         percentText = "Ready"
         status = "success"
     } else if progress >= 100 {
@@ -1425,27 +1670,55 @@ private func activityPayload(commandType: String, scanType: ScanType, progress: 
         status = "inProgress"
     }
 
-    let progressValue: Double = isReady || progress >= 100 ? 1.0 : Double(progress) / 100.0
-
     let compactRightSlot: [String: Any] = {
-        if isReady || progress >= 100 {
+        if settings.compactPresentation == .moduleIcon {
+            if isIdle {
+                return [
+                    "type": "image", "id": "cmm-compact-idle",
+                    "source": "sfSymbol", "systemImage": "pause.fill", "tint": color
+                ]
+            }
+            if isReady || progress >= 100 {
+                return [
+                    "type": "image", "id": "cmm-compact-complete",
+                    "source": "sfSymbol", "systemImage": "checkmark", "tint": color
+                ]
+            }
+        } else if isIdle || isReady || progress >= 100 {
             return [
                 "type": "text", "id": "cmm-percent",
                 "text": percentText, "style": "marquee", "tint": color
             ]
         }
-        return [
+        var progressSlot: [String: Any] = [
             "type": "progress",
             "status": status,
-            "tint": color,
-            "value": progressValue
-        ] as [String: Any]
+            "tint": color
+        ]
+        if progressIsExact {
+            progressSlot["value"] = Double(progress) / 100.0
+        }
+        return progressSlot
     }()
 
-    let sneakLeft: [String: Any] = [
-        "type": "image", "id": "cmm-icon",
-        "source": "packageFile", "fileName": "CleanMyMacIcon.png"
-    ]
+    // A frame may contain at most 64 KiB. Avoid embedding the same PNG twice:
+    // icon mode reserves official artwork for compact; text mode uses it in Sneak Peek.
+    let sneakLeft: [String: Any]
+    switch settings.compactPresentation {
+    case .moduleIcon:
+        sneakLeft = [
+            "type": "image", "id": "cmm-sneak-module-symbol",
+            "source": "sfSymbol", "systemImage": scanType.icon, "tint": color
+        ]
+    case .moduleName:
+        sneakLeft = inlineModuleIconPayload(
+            scanType: scanType,
+            id: "cmm-module-icon"
+        ) ?? [
+            "type": "image", "id": "cmm-module-icon-fallback",
+            "source": "sfSymbol", "systemImage": scanType.icon, "tint": color
+        ]
+    }
 
     let sneakCenter: [String: Any]? = if let action = currentAction {
         ["type": "text", "id": "cmm-action",
@@ -1454,17 +1727,33 @@ private func activityPayload(commandType: String, scanType: ScanType, progress: 
         nil
     }
 
-    let compactSurface: [String: Any] = [
-        "leftSlot": [
+    let compactLeftSlot: [String: Any]
+    switch settings.compactPresentation {
+    case .moduleIcon:
+        compactLeftSlot = inlineModuleIconPayload(
+            scanType: scanType,
+            id: "cmm-compact-module-icon"
+        ) ?? [
+            "type": "text", "id": "cmm-label-fallback",
+            "text": label, "style": "marquee", "tint": color
+        ]
+    case .moduleName:
+        compactLeftSlot = [
             "type": "text", "id": "cmm-label",
             "text": label, "style": "marquee", "tint": color
-        ],
+        ]
+    }
+
+    let compactSurface: [String: Any] = [
+        "leftSlot": compactLeftSlot,
         "rightSlot": compactRightSlot
     ]
 
     let sneakRight: [String: Any] = {
         let symbol: String
-        if isReady || currentAction == "Done" {
+        if isIdle {
+            symbol = "pause.circle.fill"
+        } else if isReady || currentAction == "Done" {
             symbol = "checkmark.circle.fill"
         } else if isInExecutionMode {
             switch currentExecPhase {
@@ -1506,7 +1795,7 @@ private func activityPayload(commandType: String, scanType: ScanType, progress: 
         "activityID": activityID,
         "title": pluginName,
         "priority": "normal",
-        "size": "large",
+        "size": settings.compactPresentation == .moduleIcon ? "small" : "large",
         "surfaces": [
             "compactLiveActivity": compactSurface,
             "sneakPeek": sneakPeek
@@ -1516,18 +1805,38 @@ private func activityPayload(commandType: String, scanType: ScanType, progress: 
 
 // MARK: - Plugin Main
 
+private enum MonitoringMode: String {
+    case appClosed
+    case appIdle
+    case active
+}
+
+private func pollingInterval(for mode: MonitoringMode, settings: PluginSettings) -> TimeInterval {
+    switch mode {
+    case .appClosed: return 15
+    case .appIdle: return 2
+    case .active: return settings.pollSeconds
+    }
+}
+
 private final class CleanMyMacPlugin {
     private let client: JSONSocketClient
     private let queue = DispatchQueue(label: "com.dynamiclake.cleanmymac.plugin")
     private var published = false
     private var lastSignature: String?
-    private var lastSettings: PluginSettings?
+    private var settings = PluginSettings()
+    private var lastSettingsCheck = Date.distantPast
+    private var monitoringMode: MonitoringMode = .appClosed
+    private var currentTimerInterval: TimeInterval?
     private var timer: DispatchSourceTimer?
-    private var transitionTimer: DispatchSourceTimer?
     private var dismissWorkItem: DispatchWorkItem?
     private var axObserver: AXObserver?
+    private var axRunLoopSource: CFRunLoopSource?
     private var axWatchedPID: pid_t = 0
+    private var eventTickPending = false
+    private var lastFullTick = Date.distantPast
     private var lastSendTime = Date.distantPast  // Rate-limit guard for update sends
+    private var workspaceObservers: [NSObjectProtocol] = []
 
     init(client: JSONSocketClient) { self.client = client }
 
@@ -1536,30 +1845,42 @@ private final class CleanMyMacPlugin {
         try client.connect()
         debugLog("connected")
 
-        // Start with a slow fallback timer (1s) — AXObserver will drive faster updates
-        let settings = loadSettings()
-        lastSettings = settings
-        scheduleTimer(interval: settings.pollSeconds)
-        tick()
-        dispatchMain()
+        settings = loadSettings()
+        lastSettingsCheck = Date()
+        setupWorkspaceObservers()
+        scheduleTimer(interval: pollingInterval(for: .appClosed, settings: settings))
+        queue.async { [weak self] in self?.tick() }
+        CFRunLoopRun()
     }
 
     private func scheduleTimer(interval: TimeInterval) {
+        guard currentTimerInterval != interval else { return }
         let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(250))
+        let leeway = min(1, max(0.1, interval * 0.15))
+        t.schedule(deadline: .now() + interval, repeating: interval, leeway: .milliseconds(Int(leeway * 1_000)))
         t.setEventHandler { [weak self] in self?.tick() }
         t.resume()
         timer?.cancel()
         timer = t
+        currentTimerInterval = interval
+        debugLog("monitor mode=\(monitoringMode.rawValue) interval=\(String(format: "%.2f", interval))s")
     }
-    
-    private func scheduleTransitionTimer() {
-        transitionTimer?.cancel()
-        let t = DispatchSource.makeTimerSource(queue: queue)
-        t.schedule(deadline: .now() + 0.25, repeating: 0.25, leeway: .milliseconds(50))
-        t.setEventHandler { [weak self] in self?.tick() }
-        t.resume()
-        transitionTimer = t
+
+    private func setMonitoringMode(_ mode: MonitoringMode) {
+        monitoringMode = mode
+        scheduleTimer(interval: pollingInterval(for: mode, settings: settings))
+    }
+
+    private func refreshSettingsIfNeeded() {
+        guard Date().timeIntervalSince(lastSettingsCheck) >= 5 else { return }
+        lastSettingsCheck = Date()
+        let updated = loadSettings()
+        guard updated != settings else { return }
+        settings = updated
+        lastSignature = nil
+        currentTimerInterval = nil
+        scheduleTimer(interval: pollingInterval(for: monitoringMode, settings: settings))
+        debugLog("settings reloaded")
     }
 
     private func currentActionText() -> String? {
@@ -1580,6 +1901,13 @@ private final class CleanMyMacPlugin {
             case "performance": return "Examining system"
             case "apps": return "Checking for updates"
             case "clutter": return "Analyzing storage"
+            case "storage-scan":
+                switch detectedScanType {
+                case .myClutter: return "Digging through files"
+                case .spaceLens: return "Analyzing disk space"
+                case .cloudCleanup: return "Scanning cloud storage"
+                default: return "Scanning"
+                }
             default: return nil
             }
         }
@@ -1587,44 +1915,58 @@ private final class CleanMyMacPlugin {
     }
 
     private func tick() {
+        lastFullTick = Date()
         handleCallbacks()
-
-        let settings = loadSettings()
-        if settings != lastSettings {
-            lastSettings = settings
-            lastSignature = nil
-            scheduleTimer(interval: settings.pollSeconds)
-        }
+        refreshSettingsIfNeeded()
 
         // Detect scan complete: show sneak peek when "Ready" appears
         // (handled in the isReady block below)
 
-        // Set up AXObserver if CMM is running but observer isn't attached
-        if axWatchedPID == 0 || kill(axWatchedPID, 0) != 0 {
-            setupAXObserver()
+        let cmmPID = findCMMMainPID()
+        if axWatchedPID != 0, kill(axWatchedPID, 0) != 0 {
+            cleanupAXObserver()
+        }
+        if cmmPID > 0, axWatchedPID != cmmPID {
+            setupAXObserver(pid: cmmPID)
         }
 
-        guard let state = detectCleanMyMacState() else {
-            if published { hideActivity() }
+        guard let state = detectCleanMyMacState(cmmPID: cmmPID) else {
+            setMonitoringMode(cmmPID > 0 ? .appIdle : .appClosed)
+            if settings.showOnIdle, cmmPID > 0 {
+                let sig = "idle|\(settings.compactPresentation.rawValue)"
+                if sig != lastSignature {
+                    let cmd = published ? "update" : "create"
+                    do {
+                        try client.send(activityPayload(
+                            commandType: cmd,
+                            scanType: .smartScan,
+                            progress: 0,
+                            settings: settings,
+                            isIdle: true,
+                            currentAction: "CleanMyMac is idle"
+                        ))
+                        debugLog("sent \(cmd) idle")
+                        published = true
+                        lastSignature = sig
+                    } catch {
+                        debugLog("send error: \(error)")
+                    }
+                }
+            } else if published {
+                hideActivity()
+                lastSignature = nil
+            }
             return
         }
         
-        // Manage transition timer: run fast 50ms ticks while the displayed
-        // progress is still catching up to the true value.
-        if smoothingActive && transitionTimer == nil {
-            scheduleTransitionTimer()
-        } else if !smoothingActive && transitionTimer != nil {
-            transitionTimer?.cancel()
-            transitionTimer = nil
-        }
-
         // If execution is done (all tiles final), show "Done" and schedule dismiss
         if state.isExecutionDone {
+            setMonitoringMode(.appIdle)
             let sig = "\(state.scanType.rawValue)|done"
             if sig != lastSignature {
                 let cmd = published ? "update" : "create"
                 do {
-                    try client.send(activityPayload(commandType: cmd, scanType: state.scanType, progress: 100, currentAction: isInExecutionMode ? "Done" : nil))
+                    try client.send(activityPayload(commandType: cmd, scanType: state.scanType, progress: 100, settings: settings, currentAction: isInExecutionMode ? "Done" : nil))
                     debugLog("sent \(cmd) \(state.scanType.rawValue) Done (execution complete)")
                     published = true
                     lastSignature = sig
@@ -1642,6 +1984,7 @@ private final class CleanMyMacPlugin {
 
         // If scan is complete (100%), show "Ready" and wait for user to run tasks
         if state.progress >= 100 || state.isReady {
+            setMonitoringMode(.appIdle)
             // Cancel any pending dismiss - we want to stay visible
             dismissWorkItem?.cancel()
             dismissWorkItem = nil
@@ -1652,7 +1995,7 @@ private final class CleanMyMacPlugin {
             if sig != lastSignature {
                 let cmd = published ? "update" : "create"
                 do {
-                    try client.send(activityPayload(commandType: cmd, scanType: state.scanType, progress: readyProgress, isReady: true, currentAction: "Ready to run"))
+                    try client.send(activityPayload(commandType: cmd, scanType: state.scanType, progress: readyProgress, settings: settings, isReady: true, currentAction: "Ready to run"))
                     debugLog("sent \(cmd) \(state.scanType.rawValue) Ready (progress=\(readyProgress)%)")
                     published = true
                     lastSignature = sig
@@ -1664,10 +2007,16 @@ private final class CleanMyMacPlugin {
         }
 
         // Cancel any pending dismiss if scan is still running
+        setMonitoringMode(.active)
         dismissWorkItem?.cancel()
         dismissWorkItem = nil
 
-        let sig = "\(state.scanType.rawValue)|\(state.progress)"
+        let phase = currentExecPhase ?? currentScanPhase ?? "active"
+        let usesStorageEstimate = !currentProgressIsExact && phase == "storage-scan"
+        let displayedProgress = currentProgressIsExact || usesStorageEstimate
+            ? state.progress
+            : phaseAlignedProgress(phase)
+        let sig = "\(state.scanType.rawValue)|\(phase)|\(displayedProgress)"
         guard sig != lastSignature else { return }
 
         // Rate-limit guard: DynamicLake drops updates sent too fast.
@@ -1676,8 +2025,16 @@ private final class CleanMyMacPlugin {
 
         let cmd = published ? "update" : "create"
         do {
-            try client.send(activityPayload(commandType: cmd, scanType: state.scanType, progress: state.progress, currentAction: currentActionText()))
-            debugLog("sent \(cmd) \(state.scanType.rawValue) \(state.progress)%")
+            try client.send(activityPayload(
+                commandType: cmd,
+                scanType: state.scanType,
+                progress: displayedProgress,
+                settings: settings,
+                progressIsExact: true,
+                currentAction: currentActionText()
+            ))
+            let progressSource = currentProgressIsExact ? "exact" : (usesStorageEstimate ? "storage-estimate" : "phase")
+            debugLog("sent \(cmd) \(state.scanType.rawValue) progress=\(displayedProgress)% source=\(progressSource) phase=\(phase)")
             published = true
             lastSignature = sig
             lastSendTime = Date()
@@ -1715,22 +2072,61 @@ private final class CleanMyMacPlugin {
             debugLog("dismiss error: \(error)")
         }
         published = false
-        isInExecutionMode = false
-        execPhaseIndex = 0
+        resetTrackedActivity()
+    }
+
+    // MARK: - Application lifecycle
+
+    private func setupWorkspaceObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        let launched = center.addObserver(
+            forName: NSWorkspace.didLaunchApplicationNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleID = app.bundleIdentifier,
+                  cmmMainBundleIDs.contains(bundleID) else { return }
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                invalidateCMMMainPIDCache()
+                cachedCMMMainPID = app.processIdentifier
+                lastCMMProcessScan = Date()
+                self.setMonitoringMode(.appIdle)
+                self.tick()
+            }
+        }
+        let terminated = center.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bundleID = app.bundleIdentifier,
+                  cmmMainBundleIDs.contains(bundleID) else { return }
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                invalidateCMMMainPIDCache()
+                self.cleanupAXObserver()
+                if self.published { self.hideActivity() }
+                self.lastSignature = nil
+                self.setMonitoringMode(.appClosed)
+            }
+        }
+        workspaceObservers = [launched, terminated]
     }
 
     // MARK: - AXObserver (event-driven updates)
 
-    private func setupAXObserver() {
-        // Live kernel PID lookup (same as detection — NSWorkspace goes stale)
-        let cmmPID = findCMMMainPID()
+    private func setupAXObserver(pid cmmPID: pid_t) {
         guard cmmPID > 0 else { return }
+        if axWatchedPID != 0 { cleanupAXObserver() }
 
         var observer: AXObserver?
         let result = AXObserverCreate(cmmPID, { _, element, _, _ in
-            // UI changed — trigger immediate update
+            // UI changed — trigger a coalesced near-immediate update.
             if let plugin = runningPlugin {
-                plugin.queue.async { plugin.tick() }
+                plugin.requestEventTick()
             }
         }, &observer)
 
@@ -1739,17 +2135,54 @@ private final class CleanMyMacPlugin {
             return
         }
 
-        // Watch the application element for value changes
+        // Watch both value and structural changes. CleanMyMac replaces phase
+        // views while scanning, so value-only observation can miss transitions.
         let axApp = AXUIElementCreateApplication(cmmPID)
-        AXObserverAddNotification(obs, axApp, kAXValueChangedNotification as CFString, nil)
+        let notifications: [CFString] = [
+            kAXValueChangedNotification as CFString,
+            kAXLayoutChangedNotification as CFString,
+            kAXCreatedNotification as CFString,
+            kAXUIElementDestroyedNotification as CFString,
+            kAXFocusedUIElementChangedNotification as CFString
+        ]
+        for notification in notifications {
+            let addResult = AXObserverAddNotification(obs, axApp, notification, nil)
+            if addResult != .success && addResult != .notificationAlreadyRegistered {
+                debugLog("AXObserver notification \(notification) failed: \(addResult.rawValue)")
+            }
+        }
+
+        let source = AXObserverGetRunLoopSource(obs)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .defaultMode)
+        CFRunLoopWakeUp(CFRunLoopGetMain())
 
         axObserver = obs
+        axRunLoopSource = source
         axWatchedPID = cmmPID
         debugLog("AXObserver attached to pid=\(cmmPID)")
     }
 
+    private func requestEventTick() {
+        queue.async { [weak self] in
+            guard let self, !self.eventTickPending else { return }
+            self.eventTickPending = true
+            let minimumSpacing: TimeInterval = self.monitoringMode == .active ? 0.20 : 0.75
+            let elapsed = Date().timeIntervalSince(self.lastFullTick)
+            let delay = max(0.15, minimumSpacing - elapsed)
+            self.queue.asyncAfter(deadline: .now() + delay) { [weak self] in
+                guard let self else { return }
+                self.eventTickPending = false
+                self.tick()
+            }
+        }
+    }
+
     private func cleanupAXObserver() {
         if axWatchedPID != 0 {
+            if let source = axRunLoopSource {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .defaultMode)
+            }
+            axRunLoopSource = nil
             axObserver = nil
             axWatchedPID = 0
             debugLog("AXObserver detached")
@@ -1765,6 +2198,153 @@ private var runningPlugin: CleanMyMacPlugin?
 private enum Main {
     static func main() {
         let args = Set(CommandLine.arguments.dropFirst())
+
+        if args.contains("--self-test") {
+            let cases: [(String, ScanType)] = [
+                ("Smart Care", .smartScan),
+                ("Cleanup", .systemJunk),
+                ("Protection", .malware),
+                ("Performance", .optimize),
+                ("Applications", .uninstaller),
+                ("My Clutter", .myClutter),
+                ("Space Lens", .spaceLens),
+                ("Cloud Cleanup", .cloudCleanup)
+            ]
+            for (input, expected) in cases {
+                let actual = ScanType.detect(from: input)
+                guard actual == expected else {
+                    fputs("Self-test failed: \(input) -> \(actual.rawValue), expected \(expected.rawValue)\n", stderr)
+                    exit(1)
+                }
+            }
+            guard ScanType.smartScan.assetFile == "Assets/CleanMyMac-Smart-Care.png" else {
+                fputs("Self-test failed: Smart Care artwork mapping\n", stderr)
+                exit(1)
+            }
+            guard ScanType.smartScan.color == "purple", ScanType.malware.color == "pink" else {
+                fputs("Self-test failed: Smart Care logo-matched tint\n", stderr)
+                exit(1)
+            }
+            guard hasActiveOperation(in: ["Digging through…", "/Users/example/file.heic"]),
+                  hasActiveOperation(in: ["Scanning Macintosh HD"]),
+                  !hasActiveOperation(in: ["Review All Files", "Remove 14.5 MB", "Start Over"]) else {
+                fputs("Self-test failed: active operation classification\n", stderr)
+                exit(1)
+            }
+            guard isMyClutterResultsPage(
+                ["Start Over", "My Clutter", "You have 276 files to sort through.", "Review All Files"],
+                moduleName: "My Clutter"
+            ), !isMyClutterResultsPage(["Digging through…"], moduleName: "My Clutter"),
+               estimatedStorageProgress(scanType: .myClutter, elapsed: 42.5) == 47,
+               estimatedStorageProgress(scanType: .myClutter, elapsed: 200) == 95 else {
+                fputs("Self-test failed: My Clutter progress state\n", stderr)
+                exit(1)
+            }
+            guard hasActiveOperation(in: ["Visualizing your storage space...", "/Users/example"]),
+                  isSpaceLensResultsPage(
+                      ["Start Over", "Space Lens", "Macintosh HD", "1.1 TB of 2 TB used"],
+                      moduleName: "Space Lens"
+                  ),
+                  isSpaceLensResultsPage(
+                      ["Start Over", "Space Lens", "Too empty to visualize..."],
+                      moduleName: "Space Lens"
+                  ),
+                  !isSpaceLensResultsPage(
+                      ["Space Lens", "Visualizing your storage space..."],
+                      moduleName: "Space Lens"
+                  ) else {
+                fputs("Self-test failed: Space Lens progress state\n", stderr)
+                exit(1)
+            }
+            guard phaseAlignedProgress("cleanup") == 10,
+                  phaseAlignedProgress("protection") == 35,
+                  phaseAlignedProgress("clutter") == 88 else {
+                fputs("Self-test failed: phase-aligned progress\n", stderr)
+                exit(1)
+            }
+            let adaptiveSettings = PluginSettings(pollSeconds: 0.5)
+            guard pollingInterval(for: .appClosed, settings: adaptiveSettings) == 15,
+                  pollingInterval(for: .appIdle, settings: adaptiveSettings) == 2,
+                  pollingInterval(for: .active, settings: adaptiveSettings) == 0.5 else {
+                fputs("Self-test failed: adaptive polling intervals\n", stderr)
+                exit(1)
+            }
+
+            let iconSettings = PluginSettings(compactPresentation: .moduleIcon)
+            let iconPayload = activityPayload(
+                commandType: "create",
+                scanType: .cloudCleanup,
+                progress: 42,
+                settings: iconSettings,
+                progressIsExact: true
+            )
+            guard let iconSurfaces = iconPayload["surfaces"] as? [String: Any],
+                  let iconCompact = iconSurfaces["compactLiveActivity"] as? [String: Any],
+                  let iconLeft = iconCompact["leftSlot"] as? [String: Any],
+                  iconPayload["size"] as? String == "small",
+                  iconLeft["source"] as? String == "inlineData",
+                  iconLeft["mimeType"] as? String == "image/png",
+                  let encoded = iconLeft["base64Data"] as? String,
+                  !encoded.isEmpty else {
+                fputs("Self-test failed: compact module icon payload\n", stderr)
+                exit(1)
+            }
+            guard let exactRight = iconCompact["rightSlot"] as? [String: Any],
+                  exactRight["value"] as? Double == 0.42 else {
+                fputs("Self-test failed: exact progress payload\n", stderr)
+                exit(1)
+            }
+
+            let indeterminatePayload = activityPayload(
+                commandType: "update",
+                scanType: .smartScan,
+                progress: 37,
+                settings: iconSettings
+            )
+            guard let indeterminateSurfaces = indeterminatePayload["surfaces"] as? [String: Any],
+                  let indeterminateCompact = indeterminateSurfaces["compactLiveActivity"] as? [String: Any],
+                  let indeterminateRight = indeterminateCompact["rightSlot"] as? [String: Any],
+                  indeterminateRight["type"] as? String == "progress",
+                  indeterminateRight["value"] == nil else {
+                fputs("Self-test failed: indeterminate progress payload\n", stderr)
+                exit(1)
+            }
+
+            let completePayload = activityPayload(
+                commandType: "update",
+                scanType: .systemJunk,
+                progress: 100,
+                settings: iconSettings,
+                isReady: true
+            )
+            guard let completeSurfaces = completePayload["surfaces"] as? [String: Any],
+                  let completeCompact = completeSurfaces["compactLiveActivity"] as? [String: Any],
+                  let completeRight = completeCompact["rightSlot"] as? [String: Any],
+                  completeRight["source"] as? String == "sfSymbol",
+                  completeRight["systemImage"] as? String == "checkmark" else {
+                fputs("Self-test failed: compact completion checkmark\n", stderr)
+                exit(1)
+            }
+
+            let textSettings = PluginSettings(compactPresentation: .moduleName)
+            let textPayload = activityPayload(
+                commandType: "create",
+                scanType: .spaceLens,
+                progress: 42,
+                settings: textSettings
+            )
+            guard let textSurfaces = textPayload["surfaces"] as? [String: Any],
+                  let textCompact = textSurfaces["compactLiveActivity"] as? [String: Any],
+                  let textLeft = textCompact["leftSlot"] as? [String: Any],
+                  textPayload["size"] as? String == "large",
+                  textLeft["text"] as? String == "Space Lens" else {
+                fputs("Self-test failed: compact module name payload\n", stderr)
+                exit(1)
+            }
+
+            print("Self-test passed (module mappings, payloads, adaptive polling)")
+            exit(0)
+        }
 
         if args.contains("--check") {
             print("Plugin: \(pluginName)")
@@ -1797,7 +2377,13 @@ private enum Main {
         }
 
         if args.contains("--demo-json") {
-            let payload = activityPayload(commandType: "create", scanType: .smartScan, progress: 42)
+            let payload = activityPayload(
+                commandType: "create",
+                scanType: .smartScan,
+                progress: 42,
+                settings: loadSettings(),
+                progressIsExact: true
+            )
             if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]),
                let str = String(data: data, encoding: .utf8) {
                 print(str)
